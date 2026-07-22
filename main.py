@@ -4,8 +4,8 @@ from datetime import datetime
 
 # ==========================================
 # REPLACE THESE TWO VALUES WITH YOUR OWN
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
+TELEGRAM_CHAT_ID = "8435489741"
 # ==========================================
 
 alerted_runner_ids = set()
