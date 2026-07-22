@@ -23,7 +23,7 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 def check_uk_non_runners():
-    # Category ID 247352524380009 limits the response specifically to Horse Racing
+    # Category ID 247352524380009 limits the request strictly to Horse Racing
     url = "https://api.matchbook.com/edge/rest/events?category-ids=247352524380009&states=open&include-prices=true"
     
     # Strictly check UTC date to align with Matchbook ISO timestamps
@@ -68,18 +68,26 @@ def check_uk_non_runners():
                         if prices and len(prices) > 0:
                             last_price = prices[0].get("decimal-odds", last_price)
 
-                        # If price is still None/missing, skip safely
+                        # If price is missing/null, skip safely
                         if last_price is None:
                             continue
 
                         last_price = float(last_price)
+                        runner_name = runner.get("name", "Unknown Horse")
+                        event_name = event.get("name", "UK Race")
+
+                        # =======================================================
+                        # LIVE DIAGNOSTIC PRINT (Visible in Render Dashboard Logs)
+                        # =======================================================
+                        if last_price <= 3.33:
+                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 3.33 | Triggering Alert...")
+                        else:
+                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 3.33 (Market Share < 30%)")
 
                         # 3. VALUE CHECK: Odds <= 3.33 (>= 30% Market Share)
                         if last_price <= 3.33:
                             alerted_runner_ids.add(runner_id)
 
-                            runner_name = runner.get("name", "Unknown Horse")
-                            event_name = event.get("name", "UK Race")
                             race_time = start_time_iso.split("T")[1][:5] if "T" in start_time_iso else "N/A"
                             
                             message = (
@@ -90,14 +98,14 @@ def check_uk_non_runners():
                                 f"📅 *Date:* {today_utc_str}"
                             )
                             send_telegram(message)
-                            print(f"Alert Sent: {runner_name} @ {event_name}")
+                            print(f"✅ Telegram Alert Sent: {runner_name} @ {event_name}")
 
     except Exception as e:
         print(f"Error fetching data: {e}")
 
 # Startup Notification
 print("Cloud Bot Online: Monitoring UK Non-Runners...")
-send_telegram("🚀 *Bot Online:* Successfully connected to Matchbook API! Monitoring 24/7.")
+send_telegram("🚀 *Bot Online:* Connected to Matchbook API with Live Filter Diagnostics!")
 
 while True:
     check_uk_non_runners()
