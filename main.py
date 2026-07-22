@@ -27,16 +27,16 @@ def send_telegram(message):
         print(f"Telegram error: {e}", flush=True)
 
 def check_uk_non_runners():
-    # Correct parameter: sport-ids=247352524380009 for Horse Racing
-    url = "https://api.matchbook.com/edge/rest/events?sport-ids=247352524380009&states=open&include-prices=true"
+    # Use tag-url-names=horse-racing for clean filtering on Matchbook
+    url = "https://api.matchbook.com/edge/rest/events?tag-url-names=horse-racing&states=open&include-prices=true"
     
     # Strictly check UTC date to align with Matchbook ISO timestamps
     today_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'accept': 'application/json'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept': 'application/json'
         }
         response = requests.get(url, headers=headers, timeout=10)
         
