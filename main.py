@@ -1,6 +1,10 @@
+import sys
 import requests
 import time
 from datetime import datetime, timezone
+
+# Force Python to instantly output print statements to Render logs
+sys.stdout.reconfigure(line_buffering=True)
 
 # ==========================================
 # TELEGRAM CREDENTIALS
@@ -20,7 +24,7 @@ def send_telegram(message):
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram error: {e}", flush=True)
 
 def check_uk_non_runners():
     # Category ID 247352524380009 limits the request strictly to Horse Racing
@@ -34,7 +38,7 @@ def check_uk_non_runners():
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code != 200:
-            print(f"API HTTP Error: {response.status_code}")
+            print(f"API HTTP Error: {response.status_code}", flush=True)
             return
 
         data = response.json()
@@ -43,7 +47,7 @@ def check_uk_non_runners():
         for event in events:
             start_time_iso = event.get("start", "") # e.g. "2026-07-22T14:30:00Z"
 
-            # 1. DATE CHECK: Ignore future / anti-post dates
+            # 1. DATE CHECK: Ignore future / ante-post dates
             if not start_time_iso.startswith(today_utc_str):
                 continue
 
@@ -77,12 +81,12 @@ def check_uk_non_runners():
                         event_name = event.get("name", "UK Race")
 
                         # =======================================================
-                        # LIVE DIAGNOSTIC PRINT (Visible in Render Dashboard Logs)
+                        # LIVE DIAGNOSTIC PRINT (Instantly visible in Render Logs)
                         # =======================================================
                         if last_price <= 3.33:
-                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 3.33 | Triggering Alert...")
+                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 3.33 | Triggering Alert...", flush=True)
                         else:
-                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 3.33 (Market Share < 30%)")
+                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 3.33 (Market Share < 30%)", flush=True)
 
                         # 3. VALUE CHECK: Odds <= 3.33 (>= 30% Market Share)
                         if last_price <= 3.33:
@@ -98,14 +102,14 @@ def check_uk_non_runners():
                                 f"📅 *Date:* {today_utc_str}"
                             )
                             send_telegram(message)
-                            print(f"✅ Telegram Alert Sent: {runner_name} @ {event_name}")
+                            print(f"✅ Telegram Alert Sent: {runner_name} @ {event_name}", flush=True)
 
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error fetching data: {e}", flush=True)
 
 # Startup Notification
-print("Cloud Bot Online: Monitoring UK Non-Runners...")
-send_telegram("🚀 *Bot Online:* Connected to Matchbook API with Live Filter Diagnostics!")
+print("Cloud Bot Online: Monitoring UK Non-Runners...", flush=True)
+send_telegram("🚀 *Bot Online:* Connected to Matchbook API with Unbuffered Live Diagnostics!")
 
 while True:
     check_uk_non_runners()
