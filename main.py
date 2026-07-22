@@ -86,13 +86,13 @@ def check_uk_non_runners():
                         # =======================================================
                         # LIVE DIAGNOSTIC LOG (Visible in Render Dashboard)
                         # =======================================================
-                        if last_price <= 5.33:
-                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 5.33 | Triggering Alert...", flush=True)
+                        if last_price <= 30.33:
+                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 30.33 | Triggering Alert...", flush=True)
                         else:
-                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 5.33 (Market Share < 30%)", flush=True)
+                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 30.33 (Market Share < 30%)", flush=True)
 
                         # 3. VALUE CHECK: Odds <= 3.33 (>= 30% Market Share)
-                        if last_price <= 5.33:
+                        if last_price <= 30.33:
                             alerted_runner_ids.add(runner_id)
 
                             race_time = start_time_iso.split("T")[1][:5] if "T" in start_time_iso else "N/A"
