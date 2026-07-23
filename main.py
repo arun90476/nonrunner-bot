@@ -1,138 +1,95 @@
-import os
-import time
+import datetime
 import json
+import time
 import urllib.request
-from datetime import datetime, timezone
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-# Telegram credentials populated directly
+# Configuration
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
+MATCHBOOK_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=9&include-withdrawn=true&per-page=100&states=open,suspended"
 
-# Matchbook API parameters
-MATCHBOOK_URL = (
-    "https://api.matchbook.com/edge/rest/events"
-    "?sport-ids=9"
-    "&states=open,suspended"
-    "&include-prices=true"
-    "&include-withdrawn=true"
-    "&per-page=100"
-)
-
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json'
-}
-
-POLL_INTERVAL_SECONDS = 10  # Seconds between checks
-
-# Cache set to keep track of already alerted withdrawn runner IDs
 seen_withdrawn_ids = set()
 
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-def send_telegram_alert(message: str):
-    """Sends a formatted notification to your Telegram chat/channel."""
-    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }).encode('utf-8')
-
-    req = urllib.request.Request(
-        telegram_url,
-        data=payload,
-        headers={"Content-Type": "application/json"}
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if resp.getcode() == 200:
-                print("✅ Telegram alert sent successfully.")
-    except Exception as e:
-        print(f"❌ Failed to send Telegram alert: {e}")
+def send_telegram(message):
+  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+  payload = json.dumps({
+      "chat_id": TELEGRAM_CHAT_ID,
+      "text": message,
+      "parse_mode": "Markdown",
+  }).encode("utf-8")
+  req = urllib.request.Request(
+      url, data=payload, headers={"Content-Type": "application/json"}
+  )
+  try:
+    urllib.request.urlopen(req)
+  except Exception as e:
+    print(f"Failed to send Telegram msg: {e}")
 
 
 def check_non_runners():
-    """Polls Matchbook API, checks today's races, and flags new non-runners."""
-    global seen_withdrawn_ids
+  req = urllib.request.Request(
+      MATCHBOOK_URL,
+      headers={
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          "Accept": "application/json",
+      },
+  )
 
-    today_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    req = urllib.request.Request(MATCHBOOK_URL, headers=HEADERS)
+  try:
+    with urllib.request.urlopen(req) as response:
+      data = json.loads(response.read().decode("utf-8"))
+      events = data.get("events", [])
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.getcode() != 200:
-                print(f"⚠️ Unexpected status code: {response.getcode()}")
-                return
+      today_utc = datetime.datetime.now(datetime.timezone.utc).date()
 
-            data = json.loads(response.read().decode())
-            events = data.get("events", [])
+      for event in events:
+        start_time_str = event.get("start")
+        if not start_time_str:
+          continue
 
-            # Filter events for today (UTC)
-            today_events = [e for e in events if e.get("start", "").startswith(today_utc_str)]
+        # Safely parse event date in UTC
+        event_date = datetime.datetime.fromisoformat(
+            start_time_str.replace("Z", "+00:00")
+        ).date()
 
-            for event in today_events:
-                event_name = event.get("name", "Unknown Race")
-                event_time = event.get("start", "")[11:16]  # Extracts HH:MM in UTC
+        # Check today's races
+        if event_date == today_utc:
+          event_name = event.get("name", "Unknown Event")
 
-                for market in event.get("markets", []):
-                    # Only focus on WIN market type if available
-                    market_type = market.get("market-type", "")
-                    if market_type and market_type != "WIN":
-                        continue
+          for market in event.get("markets", []):
+            # Focus on Win markets
+            if "win" in market.get("name", "").lower():
+              for runner in market.get("runners", []):
 
-                    for runner in market.get("runners", []):
-                        runner_id = runner.get("id")
-                        runner_status = runner.get("status")
+                # Detect Non-Runner state across different Matchbook flags
+                is_withdrawn = (
+                    runner.get("status") == "withdrawn"
+                    or runner.get("withdrawn") is True
+                )
+                runner_id = runner.get("id")
 
-                        if runner_status == "withdrawn":
-                            # Process only if we haven't alerted this specific runner yet
-                            if runner_id not in seen_withdrawn_ids:
-                                seen_withdrawn_ids.add(runner_id)
-                                
-                                horse_name = runner.get("name", "Unknown Horse")
-                                last_price = runner.get("last-priced-decimal")
-                                
-                                # Fallback to prices array if last-priced-decimal isn't set
-                                prices = runner.get("prices", [])
-                                if prices and not last_price:
-                                    last_price = prices[0].get("decimal-odds")
+                if is_withdrawn and runner_id not in seen_withdrawn_ids:
+                  seen_withdrawn_ids.add(runner_id)
 
-                                price_display = f"{last_price:.2f}" if last_price else "N/A"
+                  runner_name = runner.get("name")
+                  odds = runner.get("last-priced-decimal", "N/A")
 
-                                print(f"🏇 [NON-RUNNER DETECTED] {horse_name} in {event_name} @ {price_display}")
+                  msg = (
+                      f"🚨 *NON-RUNNER ALERT*\n\n"
+                      f"🏇 *Horse:* {runner_name}\n"
+                      f"📍 *Race:* {event_name}\n"
+                      f"📊 *Pre-Scratch Odds:* {odds}"
+                  )
+                  print(f"Match found: {runner_name} in {event_name}")
+                  send_telegram(msg)
 
-                                alert_msg = (
-                                    f"🚨 *NON-RUNNER ALERT*\n\n"
-                                    f"🏇 *Horse:* `{horse_name}`\n"
-                                    f"🏆 *Race:* `{event_name}`\n"
-                                    f"⏰ *Time:* `{event_time} UTC`\n"
-                                    f"📊 *Pre-Scratch Odds:* `{price_display}`"
-                                )
-                                send_telegram_alert(alert_msg)
-
-    except urllib.error.HTTPError as http_err:
-        print(f"❌ HTTP Error encountered: {http_err.code} - {http_err.reason}")
-    except urllib.error.URLError as url_err:
-        print(f"❌ Network URL Error: {url_err.reason}")
-    except Exception as e:
-        print(f"❌ Unexpected Error: {e}")
+  except Exception as e:
+    print(f"Error fetching data: {e}")
 
 
-# ==========================================
-# MAIN EXECUTION LOOP
-# ==========================================
 if __name__ == "__main__":
-    print("🚀 Matchbook Non-Runner Monitor Service Started!")
-    print(f"📅 UTC Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
-    print(f"⏱️ Polling interval: {POLL_INTERVAL_SECONDS} seconds\n")
-
-    while True:
-        check_non_runners()
-        time.sleep(POLL_INTERVAL_SECONDS)
+  print("🚀 Matchbook Non-Runner Monitor Started...")
+  while True:
+    check_non_runners()
+    time.sleep(10)
