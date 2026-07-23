@@ -1,119 +1,138 @@
-import sys
-import requests
+import os
 import time
+import json
+import urllib.request
 from datetime import datetime, timezone
 
-# Force Python to instantly output print statements to Render logs
-sys.stdout.reconfigure(line_buffering=True)
-
 # ==========================================
-# TELEGRAM CREDENTIALS
+# CONFIGURATION
+# ==========================================
+# Telegram credentials populated directly
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
+
+# Matchbook API parameters
+MATCHBOOK_URL = (
+    "https://api.matchbook.com/edge/rest/events"
+    "?sport-ids=9"
+    "&states=open,suspended"
+    "&include-prices=true"
+    "&include-withdrawn=true"
+    "&per-page=100"
+)
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+}
+
+POLL_INTERVAL_SECONDS = 10  # Seconds between checks
+
+# Cache set to keep track of already alerted withdrawn runner IDs
+seen_withdrawn_ids = set()
+
+
 # ==========================================
-
-alerted_runner_ids = set()
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+# HELPER FUNCTIONS
+# ==========================================
+def send_telegram_alert(message: str):
+    """Sends a formatted notification to your Telegram chat/channel."""
+    telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = json.dumps({
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown"
-    }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+    }).encode('utf-8')
 
-def check_uk_non_runners():
-    # Use tag-url-names=horse-racing for clean filtering on Matchbook
-    url = "https://api.matchbook.com/edge/rest/events?tag-url-names=horse-racing&states=open&include-prices=true"
-    
-    # Strictly check UTC date to align with Matchbook ISO timestamps
+    req = urllib.request.Request(
+        telegram_url,
+        data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.getcode() == 200:
+                print("✅ Telegram alert sent successfully.")
+    except Exception as e:
+        print(f"❌ Failed to send Telegram alert: {e}")
+
+
+def check_non_runners():
+    """Polls Matchbook API, checks today's races, and flags new non-runners."""
+    global seen_withdrawn_ids
+
     today_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    req = urllib.request.Request(MATCHBOOK_URL, headers=HEADERS)
 
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Accept': 'application/json'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code != 200:
-            print(f"API HTTP Error: {response.status_code}", flush=True)
-            return
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.getcode() != 200:
+                print(f"⚠️ Unexpected status code: {response.getcode()}")
+                return
 
-        data = response.json()
-        events = data.get("events", [])
+            data = json.loads(response.read().decode())
+            events = data.get("events", [])
 
-        for event in events:
-            start_time_iso = event.get("start", "") # e.g. "2026-07-22T14:30:00Z"
+            # Filter events for today (UTC)
+            today_events = [e for e in events if e.get("start", "").startswith(today_utc_str)]
 
-            # 1. DATE CHECK: Ignore future / ante-post dates
-            if not start_time_iso.startswith(today_utc_str):
-                continue
+            for event in today_events:
+                event_name = event.get("name", "Unknown Race")
+                event_time = event.get("start", "")[11:16]  # Extracts HH:MM in UTC
 
-            markets = event.get("markets", [])
-            for market in markets:
-                # Target WIN and PLACE markets
-                if market.get("market-type") not in ["WIN", "ONE_TWO_THREE"]:
-                    continue
+                for market in event.get("markets", []):
+                    # Only focus on WIN market type if available
+                    market_type = market.get("market-type", "")
+                    if market_type and market_type != "WIN":
+                        continue
 
-                runners = market.get("runners", [])
-                for runner in runners:
-                    runner_id = runner.get("id")
-                    status = runner.get("status")
+                    for runner in market.get("runners", []):
+                        runner_id = runner.get("id")
+                        runner_status = runner.get("status")
 
-                    # 2. STATUS CHECK: Newly withdrawn runners only
-                    if status == "withdrawn" and runner_id not in alerted_runner_ids:
-                        
-                        # Grab price from active prices OR fallback to last known decimal price
-                        prices = runner.get("prices", [])
-                        last_price = runner.get("last-priced-decimal")
+                        if runner_status == "withdrawn":
+                            # Process only if we haven't alerted this specific runner yet
+                            if runner_id not in seen_withdrawn_ids:
+                                seen_withdrawn_ids.add(runner_id)
+                                
+                                horse_name = runner.get("name", "Unknown Horse")
+                                last_price = runner.get("last-priced-decimal")
+                                
+                                # Fallback to prices array if last-priced-decimal isn't set
+                                prices = runner.get("prices", [])
+                                if prices and not last_price:
+                                    last_price = prices[0].get("decimal-odds")
 
-                        if prices and len(prices) > 0:
-                            last_price = prices[0].get("decimal-odds", last_price)
+                                price_display = f"{last_price:.2f}" if last_price else "N/A"
 
-                        # If price is missing/null, skip safely
-                        if last_price is None:
-                            continue
+                                print(f"🏇 [NON-RUNNER DETECTED] {horse_name} in {event_name} @ {price_display}")
 
-                        last_price = float(last_price)
-                        runner_name = runner.get("name", "Unknown Horse")
-                        event_name = event.get("name", "UK Race")
+                                alert_msg = (
+                                    f"🚨 *NON-RUNNER ALERT*\n\n"
+                                    f"🏇 *Horse:* `{horse_name}`\n"
+                                    f"🏆 *Race:* `{event_name}`\n"
+                                    f"⏰ *Time:* `{event_time} UTC`\n"
+                                    f"📊 *Pre-Scratch Odds:* `{price_display}`"
+                                )
+                                send_telegram_alert(alert_msg)
 
-                        # =======================================================
-                        # LIVE DIAGNOSTIC LOG (Visible in Render Dashboard)
-                        # =======================================================
-                        if last_price <= 30.33:
-                            print(f"[PASSED FILTER] Withdrawn: {runner_name} | Price: {last_price} <= 30.33 | Triggering Alert...", flush=True)
-                        else:
-                            print(f"[BLOCKED BY FILTER] Withdrawn: {runner_name} | Price: {last_price} > 30.33 (Market Share < 30%)", flush=True)
-
-                        # 3. VALUE CHECK: Odds <= 3.33 (>= 30% Market Share)
-                        if last_price <= 30.33:
-                            alerted_runner_ids.add(runner_id)
-
-                            race_time = start_time_iso.split("T")[1][:5] if "T" in start_time_iso else "N/A"
-                            
-                            message = (
-                                f"🚨 *TODAY'S MAJOR NON-RUNNER ALERT* 🚨\n\n"
-                                f"🏇 *Horse:* {runner_name}\n"
-                                f"📍 *Race:* {event_name} ({race_time} UTC)\n"
-                                f"📊 *Last Price:* {last_price} (≥ 30% Market Share)\n"
-                                f"📅 *Date:* {today_utc_str}"
-                            )
-                            send_telegram(message)
-                            print(f"✅ Telegram Alert Sent: {runner_name} @ {event_name}", flush=True)
-
+    except urllib.error.HTTPError as http_err:
+        print(f"❌ HTTP Error encountered: {http_err.code} - {http_err.reason}")
+    except urllib.error.URLError as url_err:
+        print(f"❌ Network URL Error: {url_err.reason}")
     except Exception as e:
-        print(f"Error fetching data: {e}", flush=True)
+        print(f"❌ Unexpected Error: {e}")
 
-# Startup Notification
-print("Cloud Bot Online: Monitoring UK Non-Runners...", flush=True)
-send_telegram("🚀 *Bot Online:* Connected to Matchbook API! Live filter active.")
 
-while True:
-    check_uk_non_runners()
-    time.sleep(10)  # Polling interval: 10 seconds
+# ==========================================
+# MAIN EXECUTION LOOP
+# ==========================================
+if __name__ == "__main__":
+    print("🚀 Matchbook Non-Runner Monitor Service Started!")
+    print(f"📅 UTC Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+    print(f"⏱️ Polling interval: {POLL_INTERVAL_SECONDS} seconds\n")
+
+    while True:
+        check_non_runners()
+        time.sleep(POLL_INTERVAL_SECONDS)
