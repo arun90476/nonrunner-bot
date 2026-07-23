@@ -6,7 +6,9 @@ import urllib.request
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
 
-EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=9&per-page=100&states=open,suspended"
+# Exact Matchbook Horse Racing Sport ID verified
+EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -30,7 +32,7 @@ def send_telegram(message):
   try:
     urllib.request.urlopen(req)
   except Exception as e:
-    print(f"Telegram alert error: {e}")
+    print(f"Telegram error: {e}")
 
 
 def get_json(url):
@@ -43,7 +45,6 @@ def check_non_runners():
   try:
     events_data = get_json(EVENTS_URL)
     events = events_data.get("events", [])
-
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
     for event in events:
@@ -51,27 +52,24 @@ def check_non_runners():
       if not start_str:
         continue
 
-      # Parse event date time in UTC
       event_dt = datetime.datetime.fromisoformat(
           start_str.replace("Z", "+00:00")
       )
 
-      # Process active races starting within 36 hours
+      # Catch all races starting within a rolling 36-hour window
       if 0 <= (event_dt - now_utc).total_seconds() <= 129600:
         event_id = event.get("id")
         event_name = event.get("name", "Unknown Race")
 
         for market in event.get("markets", []):
-          market_name = market.get("name", "").lower()
+          market_name = str(market.get("name", "")).lower()
 
-          # Focus on main Win markets
+          # Target main WIN markets
           if "win" in market_name:
             market_id = market.get("id")
 
-            # Query the dedicated runners endpoint where include-withdrawn works reliably
-            runners_url = (
-                f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?include-withdrawn=true&include-prices=false"
-            )
+            # Dedicated runner sub-endpoint where include-withdrawn=true works
+            runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=false"
 
             try:
               runners_data = get_json(runners_url)
@@ -103,10 +101,9 @@ def check_non_runners():
                   print(f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {runner_name}")
                   send_telegram(msg)
 
-            except Exception as runner_err:
+            except Exception as r_err:
               print(
-                  f"Error fetching runners for Market {market_id}:"
-                  f" {runner_err}"
+                  f"Error fetching runners for market {market_id}: {r_err}"
               )
 
   except Exception as e:
@@ -114,7 +111,7 @@ def check_non_runners():
 
 
 if __name__ == "__main__":
-  print("🚀 Matchbook Non-Runner Real-Time Monitor Started...")
+  print("🚀 Matchbook Non-Runner Service Active...")
   while True:
     check_non_runners()
     time.sleep(10)
