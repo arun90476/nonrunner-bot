@@ -6,7 +6,6 @@ import urllib.request
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
 
-# Exact Matchbook Horse Racing Sport ID verified
 EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended"
 
 HEADERS = {
@@ -41,6 +40,25 @@ def get_json(url):
     return json.loads(response.read().decode("utf-8"))
 
 
+def extract_odds(runner):
+  """Extracts the best back price or last traded decimal price."""
+  # 1. Try last-priced-decimal direct property
+  if runner.get("last-priced-decimal"):
+    return runner.get("last-priced-decimal")
+
+  # 2. Parse prices array if available
+  prices = runner.get("prices", [])
+  if prices:
+    # Sort or look for back odds
+    for p in prices:
+      if p.get("side") == "back" and p.get("decimal"):
+        return p.get("decimal")
+    if prices[0].get("decimal"):
+      return prices[0].get("decimal")
+
+  return "N/A"
+
+
 def check_non_runners():
   try:
     events_data = get_json(EVENTS_URL)
@@ -56,7 +74,6 @@ def check_non_runners():
           start_str.replace("Z", "+00:00")
       )
 
-      # Catch all races starting within a rolling 36-hour window
       if 0 <= (event_dt - now_utc).total_seconds() <= 129600:
         event_id = event.get("id")
         event_name = event.get("name", "Unknown Race")
@@ -64,12 +81,11 @@ def check_non_runners():
         for market in event.get("markets", []):
           market_name = str(market.get("name", "")).lower()
 
-          # Target main WIN markets
           if "win" in market_name:
             market_id = market.get("id")
 
-            # Dedicated runner sub-endpoint where include-withdrawn=true works
-            runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=false"
+            # ENABLE PRICES HERE (include-prices=true)
+            runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=true&price-depth=1"
 
             try:
               runners_data = get_json(runners_url)
@@ -88,7 +104,7 @@ def check_non_runners():
                   seen_withdrawn_ids.add(runner_id)
 
                   runner_name = runner.get("name", "Unknown Horse")
-                  odds = runner.get("last-priced-decimal", "N/A")
+                  odds = extract_odds(runner)
 
                   msg = (
                       f"🚨 *NON-RUNNER DETECTED*\n\n"
@@ -111,7 +127,7 @@ def check_non_runners():
 
 
 if __name__ == "__main__":
-  print("🚀 Matchbook Non-Runner Service Active...")
+  print("🚀 Matchbook Non-Runner Service Active with Price Data...")
   while True:
     check_non_runners()
     time.sleep(10)
