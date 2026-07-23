@@ -47,31 +47,38 @@ def get_json(url):
 
 
 def extract_runner_price(runner):
-  """Extracts active orderbook odds or fallback historical odds for withdrawn runners."""
+  """Exhaustive check across active orderbook AND historical API fields."""
   if not runner:
     return None
 
-  # 1. Active Orderbook Prices
+  # 1. Live back/lay prices array
   prices = runner.get("prices", [])
   if prices:
     for p in prices:
       if p.get("decimal"):
         return float(p["decimal"])
 
-  # 2. Matchbook Runner Meta-fields
-  fallback_keys = [
+  # 2. Matchbook Direct Keys for Scratched/Withdrawn Runners
+  direct_keys = [
       "last-priced-decimal",
       "withdrawn-price",
       "last-matched-price",
+      "sp",
       "starting-price",
   ]
-  for key in fallback_keys:
+  for key in direct_keys:
     val = runner.get(key)
     if val is not None:
       try:
         return float(val)
       except (ValueError, TypeError):
         continue
+
+  # 3. Check nested 'sp' dictionary if present
+  sp_data = runner.get("sp")
+  if isinstance(sp_data, dict):
+    if sp_data.get("decimal"):
+      return float(sp_data["decimal"])
 
   return None
 
@@ -107,14 +114,16 @@ def check_non_runners():
               runners_data = get_json(runners_url)
               runners = runners_data.get("runners", [])
 
-              # Pass 1: Keep live prices updated in cache
+              # Pass 1: Continuously update cache for active horses
               for runner in runners:
                 r_id = runner.get("id")
-                price = extract_runner_price(runner)
-                if price and r_id:
-                  price_cache[r_id] = price
+                status = str(runner.get("status", "")).lower()
+                if status == "open":
+                  price = extract_runner_price(runner)
+                  if price and r_id:
+                    price_cache[r_id] = price
 
-              # Pass 2: Detect and process withdrawals
+              # Pass 2: Process non-runners
               for runner in runners:
                 runner_id = runner.get("id")
                 status = str(runner.get("status", "")).lower()
@@ -129,7 +138,7 @@ def check_non_runners():
 
                   runner_name = runner.get("name", "Unknown Horse")
 
-                  # Multi-layer odds fallback: Cache -> API Metadata -> Default string
+                  # Fallback Priority: Memory Cache -> Direct Payload Extraction
                   odds = price_cache.get(runner_id) or extract_runner_price(
                       runner
                   )
@@ -139,7 +148,7 @@ def check_non_runners():
                     est_rf = (1 / odds) * 100
                     rf_display = f"~{est_rf:.1f}%"
                   else:
-                    odds_display = "N/A (No price recorded)"
+                    odds_display = "N/A"
                     rf_display = "N/A"
 
                   msg = (
@@ -165,9 +174,4 @@ def check_non_runners():
 
 
 if __name__ == "__main__":
-  print("🚀 Matchbook Non-Runner Worker Online...")
-  print("📡 Monitoring active UK/Irish/US racecards every 10 seconds...")
-
-  while True:
-    check_non_runners()
-    time.sleep(10)
+  check_non_runners()
