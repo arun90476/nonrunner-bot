@@ -6,7 +6,7 @@ import urllib.request
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
 
-EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended"
+EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended&include-prices=true&price-depth=1"
 
 HEADERS = {
     "User-Agent": (
@@ -16,6 +16,7 @@ HEADERS = {
 }
 
 seen_withdrawn_ids = set()
+price_cache = {}  # Caches last known odds for each runner ID
 
 
 def send_telegram(message):
@@ -40,23 +41,19 @@ def get_json(url):
     return json.loads(response.read().decode("utf-8"))
 
 
-def extract_odds(runner):
-  """Extracts the best back price or last traded decimal price."""
-  # 1. Try last-priced-decimal direct property
+def parse_price(runner):
+  """Attempts to extract a valid decimal price from runner dictionary."""
+  # Direct field
   if runner.get("last-priced-decimal"):
     return runner.get("last-priced-decimal")
 
-  # 2. Parse prices array if available
+  # Search inside prices array
   prices = runner.get("prices", [])
-  if prices:
-    # Sort or look for back odds
-    for p in prices:
-      if p.get("side") == "back" and p.get("decimal"):
-        return p.get("decimal")
-    if prices[0].get("decimal"):
-      return prices[0].get("decimal")
+  for p in prices:
+    if p.get("decimal"):
+      return p.get("decimal")
 
-  return "N/A"
+  return None
 
 
 def check_non_runners():
@@ -84,7 +81,14 @@ def check_non_runners():
           if "win" in market_name:
             market_id = market.get("id")
 
-            # ENABLE PRICES HERE (include-prices=true)
+            # 1. Update cache with top-level event market prices
+            for r in market.get("runners", []):
+              r_id = r.get("id")
+              p = parse_price(r)
+              if p:
+                price_cache[r_id] = p
+
+            # 2. Sub-endpoint query for dedicated non-runner detection
             runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=true&price-depth=1"
 
             try:
@@ -93,6 +97,12 @@ def check_non_runners():
 
               for runner in runners:
                 runner_id = runner.get("id")
+
+                # Update price cache if a price exists
+                live_price = parse_price(runner)
+                if live_price:
+                  price_cache[runner_id] = live_price
+
                 status = str(runner.get("status", "")).lower()
                 is_withdrawn = runner.get("withdrawn") is True or status in [
                     "withdrawn",
@@ -104,7 +114,9 @@ def check_non_runners():
                   seen_withdrawn_ids.add(runner_id)
 
                   runner_name = runner.get("name", "Unknown Horse")
-                  odds = extract_odds(runner)
+
+                  # Use cached price if current prices array is flushed
+                  odds = price_cache.get(runner_id, live_price or "N/A")
 
                   msg = (
                       f"🚨 *NON-RUNNER DETECTED*\n\n"
@@ -127,7 +139,7 @@ def check_non_runners():
 
 
 if __name__ == "__main__":
-  print("🚀 Matchbook Non-Runner Service Active with Price Data...")
+  print("🚀 Matchbook Non-Runner Service Active with Price Caching...")
   while True:
     check_non_runners()
     time.sleep(10)
