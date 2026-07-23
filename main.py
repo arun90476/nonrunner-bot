@@ -3,10 +3,12 @@ import json
 import time
 import urllib.request
 
+# --- TELEGRAM CONFIG ---
 TELEGRAM_BOT_TOKEN = "8949652801:AAFPYHnRXHERi4P28UFJKhqPaVd9RnuVeqI"
 TELEGRAM_CHAT_ID = "8435489741"
 
-EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended&include-prices=true&price-depth=1"
+# --- MATCHBOOK API ENDPOINTS ---
+EVENTS_URL = "https://api.matchbook.com/edge/rest/events?sport-ids=24735152712200&per-page=100&states=open,suspended"
 
 HEADERS = {
     "User-Agent": (
@@ -16,10 +18,11 @@ HEADERS = {
 }
 
 seen_withdrawn_ids = set()
-price_cache = {}  # Caches last known odds for each runner ID
+price_cache = {}  # Dynamic memory cache: runner_id -> decimal_price
 
 
 def send_telegram(message):
+  """Sends markdown formatted alert to Telegram."""
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
   payload = json.dumps({
       "chat_id": TELEGRAM_CHAT_ID,
@@ -30,9 +33,11 @@ def send_telegram(message):
       url, data=payload, headers={"Content-Type": "application/json"}
   )
   try:
-    urllib.request.urlopen(req)
+    with urllib.request.urlopen(req) as resp:
+      if resp.status != 200:
+        print(f"Telegram returned status {resp.status}")
   except Exception as e:
-    print(f"Telegram error: {e}")
+    print(f"Telegram API error: {e}")
 
 
 def get_json(url):
@@ -41,17 +46,32 @@ def get_json(url):
     return json.loads(response.read().decode("utf-8"))
 
 
-def parse_price(runner):
-  """Attempts to extract a valid decimal price from runner dictionary."""
-  # Direct field
-  if runner.get("last-priced-decimal"):
-    return runner.get("last-priced-decimal")
+def extract_runner_price(runner):
+  """Extracts active orderbook odds or fallback historical odds for withdrawn runners."""
+  if not runner:
+    return None
 
-  # Search inside prices array
+  # 1. Active Orderbook Prices
   prices = runner.get("prices", [])
-  for p in prices:
-    if p.get("decimal"):
-      return p.get("decimal")
+  if prices:
+    for p in prices:
+      if p.get("decimal"):
+        return float(p["decimal"])
+
+  # 2. Matchbook Runner Meta-fields
+  fallback_keys = [
+      "last-priced-decimal",
+      "withdrawn-price",
+      "last-matched-price",
+      "starting-price",
+  ]
+  for key in fallback_keys:
+    val = runner.get(key)
+    if val is not None:
+      try:
+        return float(val)
+      except (ValueError, TypeError):
+        continue
 
   return None
 
@@ -71,6 +91,7 @@ def check_non_runners():
           start_str.replace("Z", "+00:00")
       )
 
+      # 36-Hour Window
       if 0 <= (event_dt - now_utc).total_seconds() <= 129600:
         event_id = event.get("id")
         event_name = event.get("name", "Unknown Race")
@@ -80,29 +101,22 @@ def check_non_runners():
 
           if "win" in market_name:
             market_id = market.get("id")
-
-            # 1. Update cache with top-level event market prices
-            for r in market.get("runners", []):
-              r_id = r.get("id")
-              p = parse_price(r)
-              if p:
-                price_cache[r_id] = p
-
-            # 2. Sub-endpoint query for dedicated non-runner detection
-            runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=true&price-depth=1"
+            runners_url = f"https://api.matchbook.com/edge/rest/events/{event_id}/markets/{market_id}/runners?states=open,suspended&include-withdrawn=true&include-prices=true&price-depth=3"
 
             try:
               runners_data = get_json(runners_url)
               runners = runners_data.get("runners", [])
 
+              # Pass 1: Keep live prices updated in cache
+              for runner in runners:
+                r_id = runner.get("id")
+                price = extract_runner_price(runner)
+                if price and r_id:
+                  price_cache[r_id] = price
+
+              # Pass 2: Detect and process withdrawals
               for runner in runners:
                 runner_id = runner.get("id")
-
-                # Update price cache if a price exists
-                live_price = parse_price(runner)
-                if live_price:
-                  price_cache[runner_id] = live_price
-
                 status = str(runner.get("status", "")).lower()
                 is_withdrawn = runner.get("withdrawn") is True or status in [
                     "withdrawn",
@@ -115,31 +129,45 @@ def check_non_runners():
 
                   runner_name = runner.get("name", "Unknown Horse")
 
-                  # Use cached price if current prices array is flushed
-                  odds = price_cache.get(runner_id, live_price or "N/A")
+                  # Multi-layer odds fallback: Cache -> API Metadata -> Default string
+                  odds = price_cache.get(runner_id) or extract_runner_price(
+                      runner
+                  )
+
+                  if odds and odds > 1.0:
+                    odds_display = f"{odds:.2f}"
+                    est_rf = (1 / odds) * 100
+                    rf_display = f"~{est_rf:.1f}%"
+                  else:
+                    odds_display = "N/A (No price recorded)"
+                    rf_display = "N/A"
 
                   msg = (
                       f"🚨 *NON-RUNNER DETECTED*\n\n"
                       f"🏇 *Horse:* {runner_name}\n"
                       f"📍 *Race:* {event_name}\n"
-                      f"📊 *Pre-Scratch Odds:* {odds}\n"
+                      f"📊 *Pre-Scratch Odds:* `{odds_display}`\n"
+                      f"📉 *Est. Reduction Factor:* `{rf_display}`\n"
                       f"⏰ *Race Time:* {start_str[:16].replace('T', ' ')} UTC"
                   )
 
-                  print(f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {runner_name}")
+                  print(
+                      f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {runner_name} @"
+                      f" {event_name} (Odds: {odds_display})"
+                  )
                   send_telegram(msg)
 
             except Exception as r_err:
-              print(
-                  f"Error fetching runners for market {market_id}: {r_err}"
-              )
+              print(f"Error checking market {market_id}: {r_err}")
 
   except Exception as e:
-    print(f"Error checking events: {e}")
+    print(f"Execution error: {e}")
 
 
 if __name__ == "__main__":
-  print("🚀 Matchbook Non-Runner Service Active with Price Caching...")
+  print("🚀 Matchbook Non-Runner Worker Online...")
+  print("📡 Monitoring active UK/Irish/US racecards every 10 seconds...")
+
   while True:
     check_non_runners()
     time.sleep(10)
