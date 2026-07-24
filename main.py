@@ -21,28 +21,39 @@ HEADERS = {
 POLL_SECONDS = 20
 WINDOW_SECONDS = 129600  # 36 hours
 STATE_FILE = "nr_state.json"
-DEBUG_DUMP = True  # dump raw payload of first withdrawal to verify field names
+DEBUG_DUMP = True        # dump raw payloads to verify field names
+CACHE_MAX_AGE_HOURS = 48
 
 seen_withdrawn_ids = set()
-price_cache = {}  # runner_id -> {"back", "last", "vol", "ts"}
-_dumped = False
+price_cache = {}  # runner_id -> {"back","last","vol","ts","name","epoch"}
+_dumped_withdrawn = False
+_dumped_open = False
 
 
 # ---------- persistence ----------
 def load_state():
     global seen_withdrawn_ids, price_cache
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                d = json.load(f)
-            seen_withdrawn_ids = set(d.get("seen", []))
-            price_cache = {int(k): v for k, v in d.get("prices", {}).items()}
-            print(
-                f"State loaded: {len(seen_withdrawn_ids)} seen, "
-                f"{len(price_cache)} cached prices."
-            )
-        except Exception as e:
-            print(f"State load failed: {e}")
+    if not os.path.exists(STATE_FILE):
+        print("No state file — starting cold. Cache will build as it polls.")
+        return
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        seen_withdrawn_ids = set(d.get("seen", []))
+        raw = d.get("prices", {})
+        cutoff = time.time() - CACHE_MAX_AGE_HOURS * 3600
+        for k, v in raw.items():
+            try:
+                if v.get("epoch", 0) >= cutoff:
+                    price_cache[int(k)] = v
+            except (ValueError, TypeError, AttributeError):
+                continue
+        print(
+            f"State loaded: {len(seen_withdrawn_ids)} seen, "
+            f"{len(price_cache)} cached prices."
+        )
+    except Exception as e:
+        print(f"State load failed: {e}")
 
 
 def save_state():
@@ -82,6 +93,15 @@ def get_json(url):
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def is_withdrawn(runner):
+    status = str(runner.get("status", "")).lower()
+    return runner.get("withdrawn") is True or status in (
+        "withdrawn",
+        "scratched",
+        "removed",
+    )
 
 
 def extract_prices(runner):
@@ -142,8 +162,10 @@ def fmt(val):
 
 # ---------- core ----------
 def check_non_runners():
-    global _dumped
+    global _dumped_withdrawn, _dumped_open
     new_alerts = 0
+    markets_scanned = 0
+    runners_seen = 0
 
     try:
         events = get_json(EVENTS_URL).get("events", []) or []
@@ -152,6 +174,7 @@ def check_non_runners():
         return 0
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_epoch = time.time()
 
     for event in events:
         start_str = event.get("start")
@@ -189,42 +212,51 @@ def check_non_runners():
                 print(f"Market {market_id} error: {r_err}")
                 continue
 
-            # Pass 1 — snapshot live runners so odds survive the withdrawal
+            markets_scanned += 1
+            runners_seen += len(runners)
+
+            # One-time dump of a healthy open runner to confirm field names
+            if DEBUG_DUMP and not _dumped_open:
+                for runner in runners:
+                    if not is_withdrawn(runner):
+                        print("--- RAW OPEN RUNNER PAYLOAD ---")
+                        print(json.dumps(runner, indent=2)[:3000])
+                        print("--- END PAYLOAD ---")
+                        _dumped_open = True
+                        break
+
+            # Pass 1 — snapshot every non-withdrawn runner that has a price.
+            # Never overwrite with withdrawn data: that's how odds get lost.
             for runner in runners:
                 r_id = runner.get("id")
-                if not r_id:
+                if not r_id or is_withdrawn(runner):
                     continue
-                if str(runner.get("status", "")).lower() == "open":
-                    back, last, vol = extract_prices(runner)
-                    if back or last:
-                        prev = price_cache.get(r_id, {})
-                        price_cache[r_id] = {
-                            "back": back or prev.get("back"),
-                            "last": last or prev.get("last"),
-                            "vol": vol or prev.get("vol", 0),
-                            "ts": now_utc.strftime("%H:%M:%S"),
-                        }
+
+                back, last, vol = extract_prices(runner)
+                if back or last:
+                    prev = price_cache.get(r_id, {})
+                    price_cache[r_id] = {
+                        "back": back or prev.get("back"),
+                        "last": last or prev.get("last"),
+                        "vol": vol or prev.get("vol", 0),
+                        "ts": now_utc.strftime("%H:%M:%S"),
+                        "name": runner.get("name"),
+                        "epoch": now_epoch,
+                    }
 
             # Pass 2 — detect withdrawals
             for runner in runners:
                 runner_id = runner.get("id")
-                status = str(runner.get("status", "")).lower()
-                is_withdrawn = runner.get("withdrawn") is True or status in (
-                    "withdrawn",
-                    "scratched",
-                    "removed",
-                )
-
-                if not is_withdrawn or not runner_id:
+                if not runner_id or not is_withdrawn(runner):
                     continue
                 if runner_id in seen_withdrawn_ids:
                     continue
 
-                if DEBUG_DUMP and not _dumped:
+                if DEBUG_DUMP and not _dumped_withdrawn:
                     print("--- RAW WITHDRAWN RUNNER PAYLOAD ---")
                     print(json.dumps(runner, indent=2)[:3000])
                     print("--- END PAYLOAD ---")
-                    _dumped = True
+                    _dumped_withdrawn = True
 
                 runner_name = runner.get("name", "Unknown Horse")
                 cached = price_cache.get(runner_id, {})
@@ -233,13 +265,22 @@ def check_non_runners():
                 back = cached.get("back") or live_back
                 last = cached.get("last") or live_last
                 vol = cached.get("vol") or live_vol
-                snap_ts = cached.get("ts", "n/a")
+                snap_ts = cached.get("ts")
+
+                if snap_ts:
+                    snap_line = f"🕐 *Snapshot Taken:* `{snap_ts} UTC`\n"
+                else:
+                    snap_line = (
+                        "⚠️ _No pre-scratch snapshot — withdrawn before "
+                        "monitoring started._\n"
+                    )
 
                 rf_source = last or back
-                if rf_source and rf_source > 1.0:
-                    rf_display = f"~{(1 / rf_source) * 100:.1f}%"
-                else:
-                    rf_display = "N/A"
+                rf_display = (
+                    f"~{(1 / rf_source) * 100:.1f}%"
+                    if rf_source and rf_source > 1.0
+                    else "N/A"
+                )
 
                 msg = (
                     f"🚨 *NON-RUNNER DETECTED*\n\n"
@@ -249,16 +290,16 @@ def check_non_runners():
                     f"📘 *Last Back Price:* `{fmt(back)}`\n"
                     f"💰 *Matched Volume:* `{vol:,.0f}`\n"
                     f"📉 *Est. Reduction Factor:* `{rf_display}`\n"
-                    f"🕐 *Snapshot Taken:* `{snap_ts} UTC`\n"
+                    f"{snap_line}"
                     f"⏰ *Race Time:* {start_str[:16].replace('T', ' ')} UTC"
                 )
 
                 print(
                     f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {runner_name} @ "
-                    f"{event_name} (Last: {fmt(last)}, Back: {fmt(back)})"
+                    f"{event_name} (Last: {fmt(last)}, Back: {fmt(back)}, "
+                    f"snap: {snap_ts or 'none'})"
                 )
 
-                # Mark seen only after a confirmed send -> true one-time alert
                 if send_telegram(msg):
                     seen_withdrawn_ids.add(runner_id)
                     new_alerts += 1
@@ -266,6 +307,10 @@ def check_non_runners():
                 else:
                     print(f"Send failed for {runner_name} — will retry.")
 
+    print(
+        f"[{now_utc.strftime('%H:%M:%S')}] markets={markets_scanned} "
+        f"runners={runners_seen} cache={len(price_cache)} alerts={new_alerts}"
+    )
     return new_alerts
 
 
