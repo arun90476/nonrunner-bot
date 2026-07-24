@@ -18,40 +18,57 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-POLL_SECONDS = 20
-WINDOW_SECONDS = 129600  # 36 hours
-STATE_FILE = "nr_state.json"
-DEBUG_DUMP = True        # dump raw payloads to verify field names
-CACHE_MAX_AGE_HOURS = 48
+# Tiered polling: fresher snapshots when scratches actually happen
+POLL_NEAR = 15        # races within 1h
+POLL_MID = 60         # races within 6h
+POLL_FAR = 300        # everything further out
+NEAR_SECONDS = 3600
+MID_SECONDS = 21600
 
-seen_withdrawn_ids = set()
-price_cache = {}  # runner_id -> {"back","last","vol","ts","name","epoch"}
-_dumped_withdrawn = False
-_dumped_open = False
+WINDOW_SECONDS = 129600     # 36h lookahead
+PURGE_AFTER_SECONDS = 7200  # drop cache 2h after race start
+SEEN_TTL_SECONDS = 172800   # forget alerted runners after 48h
+HISTORY_LEN = 5             # price readings kept per runner
+STATE_FILE = "nr_state.json"
+
+price_cache = {}      # runner_id -> snapshot dict
+seen_withdrawn = {}   # runner_id -> epoch alerted
+_last_scan = {}       # market_id -> epoch last polled
 
 
 # ---------- persistence ----------
 def load_state():
-    global seen_withdrawn_ids, price_cache
     if not os.path.exists(STATE_FILE):
-        print("No state file — starting cold. Cache will build as it polls.")
+        print("No state file — cold start. Cache builds as it polls.")
         return
     try:
         with open(STATE_FILE) as f:
             d = json.load(f)
-        seen_withdrawn_ids = set(d.get("seen", []))
-        raw = d.get("prices", {})
-        cutoff = time.time() - CACHE_MAX_AGE_HOURS * 3600
-        for k, v in raw.items():
+        now = time.time()
+
+        for k, v in (d.get("prices") or {}).items():
             try:
-                if v.get("epoch", 0) >= cutoff:
+                if now - v.get("race_epoch", 0) < PURGE_AFTER_SECONDS:
                     price_cache[int(k)] = v
             except (ValueError, TypeError, AttributeError):
                 continue
-        print(
-            f"State loaded: {len(seen_withdrawn_ids)} seen, "
-            f"{len(price_cache)} cached prices."
-        )
+
+        raw = d.get("seen")
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                try:
+                    if now - float(v) < SEEN_TTL_SECONDS:
+                        seen_withdrawn[int(k)] = float(v)
+                except (ValueError, TypeError):
+                    continue
+        elif isinstance(raw, list):
+            for k in raw:
+                try:
+                    seen_withdrawn[int(k)] = now
+                except (ValueError, TypeError):
+                    continue
+
+        print(f"Loaded: {len(seen_withdrawn)} alerted, {len(price_cache)} cached.")
     except Exception as e:
         print(f"State load failed: {e}")
 
@@ -60,12 +77,24 @@ def save_state():
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(
-                {"seen": list(seen_withdrawn_ids), "prices": price_cache}, f
-            )
+            json.dump({"seen": seen_withdrawn, "prices": price_cache}, f)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         print(f"State save failed: {e}")
+
+
+def purge_stale():
+    now = time.time()
+    dead = [
+        r for r, v in price_cache.items()
+        if now - v.get("race_epoch", now) > PURGE_AFTER_SECONDS
+    ]
+    for r in dead:
+        price_cache.pop(r, None)
+    old = [r for r, t in seen_withdrawn.items() if now - t > SEEN_TTL_SECONDS]
+    for r in old:
+        seen_withdrawn.pop(r, None)
+    return len(dead), len(old)
 
 
 # ---------- helpers ----------
@@ -98,74 +127,68 @@ def get_json(url):
 def is_withdrawn(runner):
     status = str(runner.get("status", "")).lower()
     return runner.get("withdrawn") is True or status in (
-        "withdrawn",
-        "scratched",
-        "removed",
+        "withdrawn", "scratched", "removed",
     )
 
 
-def extract_prices(runner):
-    """Returns (best_back, last_matched, matched_volume)."""
-    best_back = None
-    matched_vol = 0.0
+def extract_book(runner):
+    """Best back (highest), best lay (lowest), mid, total offered size.
+
+    Matchbook mixes back and lay entries in one 'prices' array, so they
+    must be separated by side before taking extremes.
+    """
+    backs, lays, size = [], [], 0.0
 
     for p in runner.get("prices", []) or []:
+        try:
+            dec = float(p.get("decimal-odds") or p.get("odds") or p.get("decimal"))
+        except (TypeError, ValueError):
+            continue
+        if dec <= 1.0:
+            continue
+        try:
+            amt = float(p.get("available-amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        size += amt
+
         side = str(p.get("side", "")).lower()
-        try:
-            dec = float(p["decimal"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        if side in ("back", "lay") and best_back is None:
-            best_back = dec
-        try:
-            matched_vol += float(p.get("available-amount") or 0)
-        except (ValueError, TypeError):
-            pass
+        if side == "back":
+            backs.append(dec)
+        elif side == "lay":
+            lays.append(dec)
 
-    last_matched = None
-    for key in ("last-matched-price", "last-priced-decimal", "withdrawn-price"):
-        val = runner.get(key)
-        if val is None or isinstance(val, dict):
-            continue
-        try:
-            last_matched = float(val)
-            break
-        except (ValueError, TypeError):
-            continue
+    best_back = max(backs) if backs else None      # best price to back at
+    best_lay = min(lays) if lays else None         # best price to lay at
 
-    if last_matched is None:
-        sp = runner.get("sp")
-        if isinstance(sp, dict) and sp.get("decimal"):
-            try:
-                last_matched = float(sp["decimal"])
-            except (ValueError, TypeError):
-                pass
-        elif sp is not None and not isinstance(sp, dict):
-            try:
-                last_matched = float(sp)
-            except (ValueError, TypeError):
-                pass
+    if best_back and best_lay:
+        mid = (best_back + best_lay) / 2
+    else:
+        mid = best_back or best_lay
 
     try:
-        vol = float(runner.get("volume") or runner.get("matched-volume") or 0)
-        if vol:
-            matched_vol = vol
-    except (ValueError, TypeError):
-        pass
+        vol = float(runner.get("volume") or 0)
+    except (TypeError, ValueError):
+        vol = 0.0
 
-    return best_back, last_matched, matched_vol
+    return best_back, best_lay, mid, size, vol
 
 
-def fmt(val):
-    return f"{val:.2f}" if val else "N/A"
+def fmt(v):
+    return f"{v:.2f}" if v else "N/A"
+
+
+def poll_interval_for(delta_seconds):
+    if delta_seconds <= NEAR_SECONDS:
+        return POLL_NEAR
+    if delta_seconds <= MID_SECONDS:
+        return POLL_MID
+    return POLL_FAR
 
 
 # ---------- core ----------
-def check_non_runners():
-    global _dumped_withdrawn, _dumped_open
-    new_alerts = 0
-    markets_scanned = 0
-    runners_seen = 0
+def scan():
+    alerts = markets = stored = skipped = 0
 
     try:
         events = get_json(EVENTS_URL).get("events", []) or []
@@ -193,13 +216,22 @@ def check_non_runners():
 
         event_id = event.get("id")
         event_name = event.get("name", "Unknown Race")
+        race_epoch = event_dt.timestamp()
+        interval = poll_interval_for(delta)
 
         for market in event.get("markets", []) or []:
             if "win" not in str(market.get("name", "")).lower():
                 continue
 
             market_id = market.get("id")
-            runners_url = (
+
+            # Tiered polling — skip distant races most cycles
+            if now_epoch - _last_scan.get(market_id, 0) < interval:
+                skipped += 1
+                continue
+            _last_scan[market_id] = now_epoch
+
+            url = (
                 f"https://api.matchbook.com/edge/rest/events/{event_id}"
                 f"/markets/{market_id}/runners"
                 "?states=open,suspended&include-withdrawn=true"
@@ -207,120 +239,125 @@ def check_non_runners():
             )
 
             try:
-                runners = get_json(runners_url).get("runners", []) or []
-            except Exception as r_err:
-                print(f"Market {market_id} error: {r_err}")
+                runners = get_json(url).get("runners", []) or []
+            except Exception as e:
+                print(f"Market {market_id} error: {e}")
                 continue
 
-            markets_scanned += 1
-            runners_seen += len(runners)
+            markets += 1
 
-            # One-time dump of a healthy open runner to confirm field names
-            if DEBUG_DUMP and not _dumped_open:
-                for runner in runners:
-                    if not is_withdrawn(runner):
-                        print("--- RAW OPEN RUNNER PAYLOAD ---")
-                        print(json.dumps(runner, indent=2)[:3000])
-                        print("--- END PAYLOAD ---")
-                        _dumped_open = True
-                        break
-
-            # Pass 1 — snapshot every non-withdrawn runner that has a price.
-            # Never overwrite with withdrawn data: that's how odds get lost.
+            # ---- PASS 1: store live book for open runners ----
             for runner in runners:
-                r_id = runner.get("id")
-                if not r_id or is_withdrawn(runner):
+                rid = runner.get("id")
+                if not rid or is_withdrawn(runner):
                     continue
 
-                back, last, vol = extract_prices(runner)
-                if back or last:
-                    prev = price_cache.get(r_id, {})
-                    price_cache[r_id] = {
-                        "back": back or prev.get("back"),
-                        "last": last or prev.get("last"),
-                        "vol": vol or prev.get("vol", 0),
-                        "ts": now_utc.strftime("%H:%M:%S"),
-                        "name": runner.get("name"),
-                        "epoch": now_epoch,
-                    }
+                back, lay, mid, size, vol = extract_book(runner)
+                if not mid:
+                    continue
 
-            # Pass 2 — detect withdrawals
+                prev = price_cache.get(rid, {})
+                hist = prev.get("history", [])
+                hist.append({"t": now_utc.strftime("%H:%M:%S"), "mid": round(mid, 2)})
+                hist = hist[-HISTORY_LEN:]
+
+                price_cache[rid] = {
+                    "back": back,
+                    "lay": lay,
+                    "mid": mid,
+                    "size": size,
+                    "vol": vol,
+                    "ts": now_utc.strftime("%d-%b %H:%M:%S"),
+                    "epoch": now_epoch,
+                    "name": runner.get("name"),
+                    "race": event_name,
+                    "race_epoch": race_epoch,
+                    "history": hist,
+                }
+                stored += 1
+
+            # ---- PASS 2: withdrawal -> replay stored book, alert once ----
             for runner in runners:
-                runner_id = runner.get("id")
-                if not runner_id or not is_withdrawn(runner):
+                rid = runner.get("id")
+                if not rid or not is_withdrawn(runner):
                     continue
-                if runner_id in seen_withdrawn_ids:
+                if rid in seen_withdrawn:
                     continue
 
-                if DEBUG_DUMP and not _dumped_withdrawn:
-                    print("--- RAW WITHDRAWN RUNNER PAYLOAD ---")
-                    print(json.dumps(runner, indent=2)[:3000])
-                    print("--- END PAYLOAD ---")
-                    _dumped_withdrawn = True
+                name = runner.get("name", "Unknown Horse")
+                c = price_cache.get(rid, {})
+                lb, ll, lm, ls, lv = extract_book(runner)
 
-                runner_name = runner.get("name", "Unknown Horse")
-                cached = price_cache.get(runner_id, {})
-                live_back, live_last, live_vol = extract_prices(runner)
+                back = c.get("back") or lb
+                lay = c.get("lay") or ll
+                mid = c.get("mid") or lm
+                size = c.get("size") or ls
+                vol = c.get("vol") or lv
+                snap = c.get("ts")
+                hist = c.get("history", [])
 
-                back = cached.get("back") or live_back
-                last = cached.get("last") or live_last
-                vol = cached.get("vol") or live_vol
-                snap_ts = cached.get("ts")
-
-                if snap_ts:
-                    snap_line = f"🕐 *Snapshot Taken:* `{snap_ts} UTC`\n"
+                if snap:
+                    age = int((now_epoch - c.get("epoch", now_epoch)) / 60)
+                    snap_line = f"🕐 *Captured:* `{snap} UTC` ({age}m before scratch)\n"
                 else:
                     snap_line = (
-                        "⚠️ _No pre-scratch snapshot — withdrawn before "
-                        "monitoring started._\n"
+                        "⚠️ _No stored price — withdrawn before monitoring "
+                        "began._\n"
                     )
 
-                rf_source = last or back
-                rf_display = (
-                    f"~{(1 / rf_source) * 100:.1f}%"
-                    if rf_source and rf_source > 1.0
-                    else "N/A"
-                )
+                rf = f"~{(1 / mid) * 100:.1f}%" if mid and mid > 1.0 else "N/A"
+
+                trend = ""
+                if len(hist) >= 2:
+                    moves = " → ".join(str(h["mid"]) for h in hist)
+                    direction = (
+                        "shortening" if hist[-1]["mid"] < hist[0]["mid"]
+                        else "drifting" if hist[-1]["mid"] > hist[0]["mid"]
+                        else "steady"
+                    )
+                    trend = f"📈 *Move:* `{moves}` ({direction})\n"
 
                 msg = (
                     f"🚨 *NON-RUNNER DETECTED*\n\n"
-                    f"🏇 *Horse:* {runner_name}\n"
+                    f"🏇 *Horse:* {name}\n"
                     f"📍 *Race:* {event_name}\n"
-                    f"📊 *Last Matched:* `{fmt(last)}`\n"
-                    f"📘 *Last Back Price:* `{fmt(back)}`\n"
-                    f"💰 *Matched Volume:* `{vol:,.0f}`\n"
-                    f"📉 *Est. Reduction Factor:* `{rf_display}`\n"
+                    f"📊 *Pre-Scratch Price:* `{fmt(mid)}`\n"
+                    f"📘 *Book:* back `{fmt(back)}` / lay `{fmt(lay)}`\n"
+                    f"💰 *Offered Size:* `{size:,.0f}`\n"
+                    f"{trend}"
+                    f"📉 *Est. Reduction Factor:* `{rf}`\n"
                     f"{snap_line}"
                     f"⏰ *Race Time:* {start_str[:16].replace('T', ' ')} UTC"
                 )
 
                 print(
-                    f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {runner_name} @ "
-                    f"{event_name} (Last: {fmt(last)}, Back: {fmt(back)}, "
-                    f"snap: {snap_ts or 'none'})"
+                    f"[{now_utc.strftime('%H:%M:%S')}] ALERT: {name} @ "
+                    f"{event_name} mid={fmt(mid)} snap={snap or 'none'}"
                 )
 
                 if send_telegram(msg):
-                    seen_withdrawn_ids.add(runner_id)
-                    new_alerts += 1
+                    seen_withdrawn[rid] = now_epoch
+                    alerts += 1
                     save_state()
                 else:
-                    print(f"Send failed for {runner_name} — will retry.")
+                    print(f"Send failed for {name} — retrying next cycle.")
 
+    pc, ps = purge_stale()
     print(
-        f"[{now_utc.strftime('%H:%M:%S')}] markets={markets_scanned} "
-        f"runners={runners_seen} cache={len(price_cache)} alerts={new_alerts}"
+        f"[{now_utc.strftime('%H:%M:%S')}] markets={markets} skipped={skipped} "
+        f"stored={stored} cache={len(price_cache)} alerts={alerts} "
+        f"purged={pc}/{ps}"
     )
-    return new_alerts
+    return alerts
 
 
 if __name__ == "__main__":
     load_state()
-    print(f"Monitor started. Polling every {POLL_SECONDS}s.")
+    print("Monitor started. Tiered polling: 15s near / 60s mid / 300s far.")
     cycle = 0
     while True:
         try:
-            check_non_runners()
+            scan()
             cycle += 1
             if cycle % 15 == 0:
                 save_state()
@@ -330,4 +367,4 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"Loop error: {e}")
-        time.sleep(POLL_SECONDS)
+        time.sleep(POLL_NEAR)
