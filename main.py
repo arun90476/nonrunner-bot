@@ -31,7 +31,7 @@ HISTORY_LEN = 5
 STATE_FILE = os.environ.get("STATE_FILE", "nr_state.json")
 
 # --- ALERT FILTERS (all must pass for a notification) ---
-MAX_ODDS = 3.5          # only alert if pre-scratch mid <= this
+MAX_ODDS = 5.0          # only alert if pre-scratch mid <= this
 REQUIRE_VOLUME = True   # only alert if matched volume > 0
 UK_TZ = ZoneInfo("Europe/London")  # today's UK card only (BST-aware)
 
