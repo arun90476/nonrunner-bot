@@ -6,6 +6,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from zoneinfo import ZoneInfo
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -24,12 +25,15 @@ HEADERS = {
 }
 
 POLL_SECONDS = 15
-WINDOW_SECONDS = 43200
 PURGE_AFTER_SECONDS = 7200
 SEEN_TTL_SECONDS = 172800
 HISTORY_LEN = 5
 STATE_FILE = os.environ.get("STATE_FILE", "nr_state.json")
-SUPPRESS_UNPRICED = False
+
+# --- ALERT FILTERS (all must pass for a notification) ---
+MAX_ODDS = 3.5          # only alert if pre-scratch mid <= this
+REQUIRE_VOLUME = True   # only alert if matched volume > 0
+UK_TZ = ZoneInfo("Europe/London")  # today's UK card only (BST-aware)
 
 price_cache = {}
 seen_withdrawn = {}
@@ -45,6 +49,28 @@ def err(msg, exc=None):
     log(f"[ERR] {msg}")
     if exc is not None:
         print(traceback.format_exc(), flush=True)
+
+
+def is_today_uk(event_dt_utc):
+    """True if the race's start, in UK local time, falls on today's UK date."""
+    now_uk = datetime.datetime.now(UK_TZ)
+    race_uk = event_dt_utc.astimezone(UK_TZ)
+    return race_uk.date() == now_uk.date()
+
+
+def passes_filters(cached):
+    """All alert conditions. Returns (ok, reason_if_not)."""
+    if not cached:
+        return False, "no cached price"
+    mid = cached.get("mid")
+    vol = cached.get("vol") or 0
+    if not mid or mid <= 1.0:
+        return False, "no usable price"
+    if mid > MAX_ODDS:
+        return False, f"odds {mid:.2f} > {MAX_ODDS}"
+    if REQUIRE_VOLUME and vol <= 0:
+        return False, "matched volume is 0"
+    return True, ""
 
 
 # ---------- persistence ----------
@@ -132,12 +158,7 @@ def is_withdrawn(runner):
 
 
 def extract_book(runner):
-    """Binary exchange: side 'win' = back the horse, side 'lose' = lay it.
-
-    Best back = highest available 'win' decimal price.
-    Best lay-equivalent = derived from the 'lose' side.
-    Returns (best_back, best_lay_equiv, mid, matched_volume).
-    """
+    """Binary exchange: side 'win' = back the horse, side 'lose' = lay it."""
     win_prices, lose_prices, size = [], [], 0.0
 
     for p in runner.get("prices", []) or []:
@@ -150,24 +171,16 @@ def extract_book(runner):
         if not dec or dec <= 1.0:
             continue
         side = str(p.get("side", "")).lower()
-        if side == "win":
+        if side in ("win", "back"):
             win_prices.append(dec)
-        elif side == "lose":
-            lose_prices.append(dec)
-        # legacy fallback if a market ever returns back/lay
-        elif side == "back":
-            win_prices.append(dec)
-        elif side == "lay":
+        elif side in ("lose", "lay"):
             lose_prices.append(dec)
 
-    # best back = best price you can back the horse to WIN at (highest win odds)
     best_back = max(win_prices) if win_prices else None
 
-    # convert best 'lose' offer to the lay-equivalent win-odds:
-    # if you can back "lose" at decimal L, that implies laying the win at L/(L-1)
     best_lay = None
     if lose_prices:
-        best_lose = max(lose_prices)  # best available lose-side price
+        best_lose = max(lose_prices)
         if best_lose > 1.0:
             best_lay = best_lose / (best_lose - 1.0)
 
@@ -232,7 +245,7 @@ def build_alert(name, race, race_time, cached, live=None, reason="withdrawn"):
 
 # ---------- core ----------
 def scan(warmup=False):
-    alerts = markets = stored = withdrawn_seen = vanished = 0
+    alerts = markets = stored = withdrawn_seen = vanished = filtered = 0
 
     try:
         events = get_json(EVENTS_URL).get("events", []) or []
@@ -252,8 +265,8 @@ def scan(warmup=False):
         except ValueError:
             continue
 
-        delta = (event_dt - now_utc).total_seconds()
-        if not (0 <= delta <= WINDOW_SECONDS):
+        # FILTER 1: today's UK card only, and not already started
+        if event_dt <= now_utc or not is_today_uk(event_dt):
             continue
 
         event_id = event.get("id")
@@ -318,8 +331,17 @@ def scan(warmup=False):
                     if warmup:
                         seen_withdrawn[gone_id] = now_epoch
                         continue
-                    msg = build_alert(info["name"], info["race"], info["race_time"],
-                                      price_cache.get(gone_id), None, reason="vanished")
+                    cached = price_cache.get(gone_id)
+                    ok, why = passes_filters(cached)
+                    if not ok:
+                        seen_withdrawn[gone_id] = now_epoch
+                        filtered += 1
+                        log(f"FILTERED (vanished): {info['name']} @ "
+                            f"{info['race']} — {why}")
+                        continue
+                    msg = build_alert(info["name"], info["race"],
+                                      info["race_time"], cached, None,
+                                      reason="vanished")
                     if send_telegram(msg):
                         seen_withdrawn[gone_id] = now_epoch
                         alerts += 1
@@ -343,12 +365,19 @@ def scan(warmup=False):
                 if warmup:
                     seen_withdrawn[rid] = now_epoch
                     continue
+
+                # FILTERS 2 + 3: odds <= MAX_ODDS AND volume > 0
                 cached = price_cache.get(rid)
-                if not cached and SUPPRESS_UNPRICED:
+                ok, why = passes_filters(cached)
+                if not ok:
                     seen_withdrawn[rid] = now_epoch
+                    filtered += 1
+                    log(f"FILTERED: {name} @ {event_name} — {why}")
                     continue
+
                 msg = build_alert(name, event_name, race_time, cached, runner)
-                log(f"ALERT: {name} @ {event_name} (cached: {'yes' if cached else 'no'})")
+                log(f"ALERT: {name} @ {event_name} mid={cached['mid']:.2f} "
+                    f"vol={cached.get('vol', 0):.0f}")
                 if send_telegram(msg):
                     seen_withdrawn[rid] = now_epoch
                     alerts += 1
@@ -356,12 +385,15 @@ def scan(warmup=False):
 
     purge_stale()
     log(f"markets={markets} stored={stored} cache={len(price_cache)} "
-        f"withdrawn={withdrawn_seen} vanished={vanished} alerts={alerts}")
+        f"withdrawn={withdrawn_seen} vanished={vanished} "
+        f"filtered={filtered} alerts={alerts}")
     return alerts
 
 
 if __name__ == "__main__":
     log("=== NON-RUNNER MONITOR STARTING ===")
+    log(f"Filters: today's UK card only | odds <= {MAX_ODDS} | "
+        f"volume > 0 required: {REQUIRE_VOLUME}")
     load_state()
     log("Warm-up scan...")
     try:
